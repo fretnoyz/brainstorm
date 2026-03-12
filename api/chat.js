@@ -1,8 +1,33 @@
+import { createClient } from '@supabase/supabase-js';
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
+  // ── Auth check ──────────────────────────────────────
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.replace("Bearer ", "");
+
+  if (!token) {
+    return res.status(401).json({ error: "Not authenticated." });
+  }
+
+  const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!supabaseUrl || !supabaseServiceKey) {
+    return res.status(500).json({ error: "Supabase not configured on the server." });
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseServiceKey);
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+
+  if (authError || !user) {
+    return res.status(401).json({ error: "Invalid or expired session." });
+  }
+
+  // ── AI provider config ─────────────────────────────
   const source = (process.env.MODEL_SOURCE || "anthropic").toLowerCase();
   const model = process.env.MODEL_NAME || "claude-sonnet-4-20250514";
   const apiKey = process.env.API_KEY || "";

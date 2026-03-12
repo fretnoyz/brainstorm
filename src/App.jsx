@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { supabase } from "./supabaseClient";
 
 const SYSTEM_PROMPT = `You are acting as a **Latent Intent Interrogator**.
 
@@ -266,6 +267,14 @@ function InlineMarkdown({ text }) {
 }
 
 export default function BrainstormApp() {
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [authMode, setAuthMode] = useState("login"); // login | signup
+  const [signupName, setSignupName] = useState("");
   const [stage, setStage] = useState("input"); // input | session
   const [sourceText, setSourceText] = useState("");
   const [messages, setMessages] = useState([]);
@@ -274,9 +283,133 @@ export default function BrainstormApp() {
   const [currentPhase, setCurrentPhase] = useState(0);
   const [error, setError] = useState(null);
   const [streamingText, setStreamingText] = useState("");
+  const [sessions, setSessions] = useState([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState(null);
   const chatEndRef = useRef(null);
   const textareaRef = useRef(null);
   const inputTextareaRef = useRef(null);
+
+  // Check auth session on mount
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Load past sessions when user is available
+  useEffect(() => {
+    if (user) loadSessions();
+  }, [user]);
+
+  async function loadSessions() {
+    setSessionsLoading(true);
+    const { data, error } = await supabase
+      .from("brainstorm_sessions")
+      .select("id, title, source_text, current_phase, status, created_at, updated_at")
+      .order("updated_at", { ascending: false });
+    if (!error) setSessions(data || []);
+    setSessionsLoading(false);
+  }
+
+  async function createDBSession(text) {
+    const title = text.slice(0, 80).replace(/\n/g, " ").trim() || "Untitled Session";
+    const { data, error } = await supabase
+      .from("brainstorm_sessions")
+      .insert({ user_id: user.id, title, source_text: text, current_phase: 1 })
+      .select("id")
+      .single();
+    if (error) console.error("Failed to create session:", error);
+    return data?.id || null;
+  }
+
+  async function saveDBMessage(sessionId, role, content, isSource = false) {
+    if (!sessionId) return;
+    const { error } = await supabase
+      .from("brainstorm_messages")
+      .insert({ session_id: sessionId, role, content, is_source: isSource });
+    if (error) console.error("Failed to save message:", error);
+  }
+
+  async function updateDBSessionPhase(sessionId, phase) {
+    if (!sessionId) return;
+    await supabase
+      .from("brainstorm_sessions")
+      .update({ current_phase: phase })
+      .eq("id", sessionId);
+  }
+
+  async function resumeSession(session) {
+    const { data: msgs, error } = await supabase
+      .from("brainstorm_messages")
+      .select("role, content, is_source, created_at")
+      .eq("session_id", session.id)
+      .order("created_at", { ascending: true });
+    if (error) {
+      console.error("Failed to load messages:", error);
+      return;
+    }
+    setCurrentSessionId(session.id);
+    setCurrentPhase(session.current_phase || 0);
+    setSourceText(session.source_text);
+    setMessages(
+      (msgs || []).map((m) => ({
+        role: m.role,
+        text: m.content,
+        isSource: m.is_source,
+      }))
+    );
+    setStage("session");
+  }
+
+  async function deleteSession(sessionId) {
+    await supabase.from("brainstorm_sessions").delete().eq("id", sessionId);
+    setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    if (currentSessionId === sessionId) resetSession();
+  }
+
+  async function handleLogin(e) {
+    e.preventDefault();
+    setLoginLoading(true);
+    setAuthError(null);
+    const { error } = await supabase.auth.signInWithPassword({
+      email: loginEmail,
+      password: loginPassword,
+    });
+    if (error) setAuthError(error.message);
+    setLoginLoading(false);
+  }
+
+  async function handleSignUp(e) {
+    e.preventDefault();
+    setLoginLoading(true);
+    setAuthError(null);
+    const { error } = await supabase.auth.signUp({
+      email: loginEmail,
+      password: loginPassword,
+      options: {
+        data: { full_name: signupName },
+      },
+    });
+    if (error) {
+      setAuthError(error.message);
+    } else {
+      setAuthError(null);
+      setAuthMode("confirm");
+    }
+    setLoginLoading(false);
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setUser(null);
+    resetSession();
+  }
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -289,9 +422,13 @@ export default function BrainstormApp() {
   }, [stage, loading]);
 
   async function callAPI(apiMessages) {
+    const { data: { session } } = await supabase.auth.getSession();
     const response = await fetch("/api/chat", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${session?.access_token || ""}`,
+      },
       body: JSON.stringify({
         messages: apiMessages,
         system: SYSTEM_PROMPT,
@@ -313,23 +450,33 @@ export default function BrainstormApp() {
     setLoading(true);
     setError(null);
 
-    const userMsg = {
-      role: "user",
-      content: `Here is my source material for interrogation:\n\n${sourceText}`,
-    };
+    // Create DB session
+    const sessionId = await createDBSession(sourceText);
+    setCurrentSessionId(sessionId);
+
+    const userContent = `Here is my source material for interrogation:\n\n${sourceText}`;
+    const userMsg = { role: "user", content: userContent };
     const newMessages = [userMsg];
     setMessages([{ role: "user", text: sourceText, isSource: true }]);
+
+    // Save source message
+    await saveDBMessage(sessionId, "user", sourceText, true);
 
     try {
       const reply = await callAPI(newMessages.map((m) => ({ role: m.role, content: m.content })));
       const phase = detectPhase(reply);
-      if (phase) setCurrentPhase(phase);
+      if (phase) {
+        setCurrentPhase(phase);
+        await updateDBSessionPhase(sessionId, phase);
+      }
       setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
+      await saveDBMessage(sessionId, "assistant", reply);
       newMessages.push({ role: "assistant", content: reply });
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
+      loadSessions();
     }
   }
 
@@ -343,13 +490,20 @@ export default function BrainstormApp() {
     const updatedMessages = [...messages, { role: "user", text }];
     setMessages(updatedMessages);
 
+    // Save user message
+    await saveDBMessage(currentSessionId, "user", text);
+
     const apiMessages = buildAPIMessages(updatedMessages);
 
     try {
       const reply = await callAPI(apiMessages);
       const phase = detectPhase(reply);
-      if (phase) setCurrentPhase(phase);
+      if (phase) {
+        setCurrentPhase(phase);
+        await updateDBSessionPhase(currentSessionId, phase);
+      }
       setMessages((prev) => [...prev, { role: "assistant", text: reply }]);
+      await saveDBMessage(currentSessionId, "assistant", reply);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -382,6 +536,115 @@ export default function BrainstormApp() {
     setCurrentPhase(0);
     setError(null);
     setStreamingText("");
+    setCurrentSessionId(null);
+    loadSessions();
+  }
+
+  // AUTH LOADING
+  if (authLoading) {
+    return (
+      <div style={styles.root}>
+        <div style={{ ...styles.inputStage, justifyContent: "center" }}>
+          <div style={styles.brandMark}>
+            <div style={styles.brandIcon}>
+              <img src="/tq-logo.png" alt="Texas Quantitative" width="48" height="48" style={{ borderRadius: 8 }} />
+            </div>
+            <h1 style={styles.brandTitle}>Brainstorm</h1>
+            <p style={styles.brandSub}>Loading...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // LOGIN SCREEN
+  if (!user) {
+    return (
+      <div style={styles.root}>
+        <div style={styles.inputStage}>
+          <div style={styles.brandMark}>
+            <div style={styles.brandIcon}>
+              <img src="/tq-logo.png" alt="Texas Quantitative" width="48" height="48" style={{ borderRadius: 8 }} />
+            </div>
+            <h1 style={styles.brandTitle}>Brainstorm</h1>
+            <p style={styles.brandSub}>Latent Intent Interrogator</p>
+          </div>
+
+          <div style={styles.inputCard}>
+            <label style={styles.inputLabel}>{authMode === "signup" ? "Create Account" : "Sign In"}</label>
+            <p style={styles.inputHint}>
+              {authMode === "signup"
+                ? "Create a new Texas Quantitative account."
+                : "Sign in with your Texas Quantitative account to continue."}
+            </p>
+            {authMode === "confirm" ? (
+              <div style={{ textAlign: "center", padding: "20px 0" }}>
+                <p style={{ color: "#c4a265", fontSize: 15, marginBottom: 12 }}>Check your email</p>
+                <p style={{ color: "#8a8780", fontSize: 13 }}>We sent a confirmation link to <strong style={{ color: "#d4d0c8" }}>{loginEmail}</strong>. Click it to activate your account, then come back and sign in.</p>
+                <button
+                  type="button"
+                  style={{ ...styles.resetBtn, marginTop: 20 }}
+                  onClick={() => { setAuthMode("login"); setAuthError(null); }}
+                >
+                  Back to Sign In
+                </button>
+              </div>
+            ) : (
+            <form onSubmit={authMode === "signup" ? handleSignUp : handleLogin} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              {authMode === "signup" && (
+                <input
+                  type="text"
+                  placeholder="Full Name"
+                  value={signupName}
+                  onChange={(e) => setSignupName(e.target.value)}
+                  style={styles.authInput}
+                  required
+                  autoFocus
+                />
+              )}
+              <input
+                type="email"
+                placeholder="Email"
+                value={loginEmail}
+                onChange={(e) => setLoginEmail(e.target.value)}
+                style={styles.authInput}
+                required
+                autoFocus={authMode !== "signup"}
+              />
+              <input
+                type="password"
+                placeholder="Password"
+                value={loginPassword}
+                onChange={(e) => setLoginPassword(e.target.value)}
+                style={styles.authInput}
+                required
+              />
+              {authError && (
+                <div style={styles.errorBanner}>{authError}</div>
+              )}
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <button
+                  type="button"
+                  style={{ background: "none", border: "none", color: "#c4a265", fontSize: 13, cursor: "pointer", padding: 0, fontFamily: "'IBM Plex Sans', sans-serif" }}
+                  onClick={() => { setAuthMode(authMode === "login" ? "signup" : "login"); setAuthError(null); }}
+                >
+                  {authMode === "login" ? "Create an account" : "Already have an account? Sign in"}
+                </button>
+                <button
+                  type="submit"
+                  style={{ ...styles.startBtn, opacity: loginLoading ? 0.5 : 1 }}
+                  disabled={loginLoading}
+                >
+                  {loginLoading ? (authMode === "signup" ? "Creating..." : "Signing in...") : (authMode === "signup" ? "Create Account" : "Sign In")}
+                  <span style={styles.btnArrow}>→</span>
+                </button>
+              </div>
+            </form>
+            )}
+          </div>
+        </div>
+      </div>
+    );
   }
 
   // INPUT STAGE
@@ -437,6 +700,47 @@ export default function BrainstormApp() {
               </div>
             ))}
           </div>
+
+          {/* Past Sessions */}
+          {sessions.length > 0 && (
+            <div style={styles.sessionListCard}>
+              <label style={styles.inputLabel}>Past Sessions</label>
+              <div style={styles.sessionList}>
+                {sessions.map((s) => (
+                  <div key={s.id} style={styles.sessionListItem}>
+                    <div
+                      style={styles.sessionListContent}
+                      onClick={() => resumeSession(s)}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <div style={styles.sessionListTitle}>{s.title}</div>
+                      <div style={styles.sessionListMeta}>
+                        <span>{PHASES[s.current_phase - 1]?.icon || "◇"} Phase {s.current_phase}</span>
+                        <span style={styles.sessionListDot}>·</span>
+                        <span>{new Date(s.updated_at).toLocaleDateString()}</span>
+                        <span style={styles.sessionListDot}>·</span>
+                        <span style={{ color: s.status === "completed" ? "#6a9955" : "#c4a265" }}>
+                          {s.status === "completed" ? "Completed" : "Active"}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      style={styles.sessionDeleteBtn}
+                      onClick={(e) => { e.stopPropagation(); deleteSession(s.id); }}
+                      title="Delete session"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <button style={{ ...styles.resetBtn, marginTop: 16 }} onClick={handleLogout}>
+            Sign Out
+          </button>
         </div>
       </div>
     );
@@ -471,6 +775,9 @@ export default function BrainstormApp() {
 
           <button style={styles.resetBtn} onClick={resetSession}>
             New Session
+          </button>
+          <button style={styles.resetBtn} onClick={handleLogout}>
+            Sign Out
           </button>
         </div>
 
@@ -999,5 +1306,80 @@ const styles = {
     margin: "10px 0",
     color: "#9a968e",
     fontStyle: "italic",
+  },
+  authInput: {
+    width: "100%",
+    background: "#0d0d0f",
+    border: "1px solid #2a2a32",
+    borderRadius: 8,
+    padding: "12px 16px",
+    color: "#d4d0c8",
+    fontFamily: "'IBM Plex Sans', sans-serif",
+    fontSize: 14,
+    lineHeight: 1.5,
+    transition: "border-color 0.2s",
+  },
+
+  // Session List
+  sessionListCard: {
+    width: "100%",
+    background: "#15151a",
+    border: "1px solid #222228",
+    borderRadius: 12,
+    padding: 28,
+  },
+  sessionList: {
+    marginTop: 14,
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    maxHeight: 280,
+    overflowY: "auto",
+  },
+  sessionListItem: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    background: "#0d0d0f",
+    border: "1px solid #2a2a32",
+    borderRadius: 8,
+    padding: "10px 14px",
+    transition: "border-color 0.2s",
+  },
+  sessionListContent: {
+    flex: 1,
+    cursor: "pointer",
+    minWidth: 0,
+  },
+  sessionListTitle: {
+    fontSize: 13,
+    color: "#d4d0c8",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    fontWeight: 500,
+  },
+  sessionListMeta: {
+    fontFamily: "'IBM Plex Mono', monospace",
+    fontSize: 10,
+    color: "#666",
+    marginTop: 4,
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  sessionListDot: {
+    color: "#444",
+  },
+  sessionDeleteBtn: {
+    background: "transparent",
+    border: "none",
+    color: "#555",
+    fontSize: 12,
+    cursor: "pointer",
+    padding: "4px 6px",
+    borderRadius: 4,
+    transition: "color 0.2s",
+    flexShrink: 0,
   },
 };
